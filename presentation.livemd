@@ -1,0 +1,493 @@
+# Pipework
+
+## Pipeline
+
+![](images/pipeline.png)
+
+## Components
+
+* context
+* pipe
+* branch pipe
+* concurrent task branch
+* hook
+
+## Executable
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defprotocol Pipework.Executable do
+  @moduledoc false
+
+  @spec exec(__MODULE__.t(), Pipework.Context.t()) :: Pipework.Context.t()
+  def exec(executable, context)
+
+  @spec hooks(__MODULE__.t()) :: [Pipework.Hook.hook()]
+  def hooks(executable)
+end
+
+defimpl Pipework.Executable, for: Pipework.Pipe ...
+defimpl Pipework.Executable, for: Pipework.BranchPipe ...
+defimpl Pipework.Executable, for: Pipework.TaskPipe ...
+```
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defmodule Pipework.PipeExecutor do
+  alias Pipework.{Executable, Hook}
+
+  def exec(executable, context) do
+    case Executable.hooks(executable) do
+      [] ->
+        Executable.exec(executable, context)
+
+      hooks ->
+        executor = fn context -> Executable.exec(executable, context) end
+        Hook.exec_with_hooks(hooks, context, executor)
+    end
+  end
+end
+```
+
+## Pipeline build and execute
+
+#### definition of pipeline
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+pipes = [
+  Pipe1,
+  Pipe2,
+  {:pipeline, Pipeline1},
+  {:branch, BrnachPipe, [{:branch1, Branch1}, {:branch2, Branch2}]},
+  {:task, TaskPipe}
+]
+
+Pipework.run(context, pipes)
+```
+
+## Hook
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defmodule Pipework.Hook do
+  @moduledoc false
+
+  alias Pipework.Context
+
+  @type hook :: {atom(), Keyword.t()} | atom()
+  @type next :: (Context.t() -> Context.t())
+  @callback call(Context.t(), Pipework.opts(), next()) :: Context.t()
+
+  @spec exec_with_hooks([hook()], Context.t(), next()) :: Context.t()
+  def exec_with_hooks(hooks, context, executor) do
+    hooks = init_hooks(hooks)
+
+    hooked_executor =
+      Enum.reduce(hooks, executor, fn {hook, opts}, acc ->
+        fn ctx -> hook.call(ctx, opts, acc) end
+      end)
+
+    hooked_executor.(context)
+  end
+
+  ...
+end
+```
+
+## Task(concurrent) pipe
+
+![](images/task_pipe.png)
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defmodule Pipework.TaskPipe do
+  @moduledoc false
+
+  @type t :: %__MODULE__{
+          task_pipe: atom(),
+          task_executor: atom(),
+          opts: Pipework.opts()
+        }
+
+  @callback generate(Pipework.Context.t(), Pipework.opts()) ::
+              [{Pipework.Executable.t(), Pipework.Context.t()}]
+
+  @callback collect(Pipework.Context.t(), [Pipework.Context.t()], Pipework.opts()) ::
+              Pipework.Context.t()
+
+  @enforce_keys [:task_pipe]
+  defstruct task_pipe: nil, opts: [], task_executor: nil
+end
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defimpl Pipework.Executable, for: Pipework.TaskPipe do
+  def exec(
+        %Pipework.TaskPipe{
+          task_pipe: task_pipe,
+          task_executor: task_executor,
+          opts: opts
+        },
+        context
+      ) do
+    case task_pipe.generate(context, opts) do
+      tasks when is_list(tasks) ->
+        task_executor = task_executor || Pipework.TaskExecutor.Naive
+        contexts = task_executor.exec(tasks, opts)
+        task_pipe.collect(context, contexts, opts)
+
+      other ->
+        raise "#{task_pipe}.generate/1 should return a list for tasks, got #{inspect(other)}"
+    end
+  end
+
+  def hooks(_), do: []
+end
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### Tasks executor
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+defmodule Pipework.TaskExecutor do
+  @moduledoc false
+
+  @callback exec([{Pipework.Executable.t(), Pipework.Context.t()}], Keyword.t()) :: [
+              Pipework.Context.t()
+            ]
+end
+
+defmodule Pipework.TaskExecutor.Naive do
+  use Pipework.TaskExecutor
+
+  @impl true
+  def exec(pipe_and_context_pairs, opts) do
+    timeout = Keyword.get(opts, :timeout, 5000)
+
+    pipe_and_context_pairs
+    |> Enum.map(fn {pipe, context} ->
+      Task.async(fn -> Pipework.PipeExecutor.exec(pipe, context) end)
+    end)
+    |> Task.await_many(timeout)
+  end
+end
+
+```
+
+## How to build&run
+
+#### use macro
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+  def quote_pipe(
+        %Pipe.BranchPipe{branch_pipes: branch_pipes} = branch_pipe,
+        acc,
+        env,
+        builder_opts
+      ) do
+    call = Pipe.Buildable.quote_pipe_call(branch_pipe)
+    {error_message, halt_message} = Pipe.Buildable.get_build_message(branch_pipe, env)
+
+    branch_clauses =
+      Enum.flat_map(branch_pipes, fn {branch, pipe} ->
+        quote do
+          %Pipe.Context{pipe_branch: unquote(branch)} = context ->
+            context = Map.put(context, :pipe_branch, nil)
+            unquote(Pipe.Buildable.quote_pipe(pipe, acc, env, builder_opts))
+        end
+      end)
+
+    {fun, meta, [arg, [do: [halted_clause | other_clauses]]]} =
+      quote context: Pipe.Builder do
+        case unquote(call) do
+          %Pipe.Context{halted: true} = context ->
+            unquote(Pipe.Builder.quote_log_halt(halt_message, builder_opts))
+            context
+
+          %Pipe.Context{} = context ->
+            raise "branch pipe result can not match any pipe #{inspect(context)}"
+
+          other ->
+            raise unquote(error_message) <> ", got: #{inspect(other)}"
+        end
+      end
+
+    new_clauses = [halted_clause | branch_clauses] ++ other_clauses
+    {fun, meta, [arg, [do: new_clauses]]}
+  end
+```
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+(
+  MyPipe.__info__(:module)
+  MyBranch.__info__(:module)
+  defp(pipe_builder_call(context, opts)) do
+    tasks_res = Pipe.TaskExecutor.Naive.exec([fn -> MyTask1.exec(context, []) end, fn -> MyTask2.exec(context, task_opt: "task2_opt") end], [])
+    context = Map.put(context, :tasks_res, tasks_res)
+    case(TaskCollector.exec(context, [])) do
+      %Pipe.Context{halted: true} = context ->
+        nil
+        context
+      %Pipe.Context{} = context ->
+        case(MyBranch.exec(context, [])) do
+          %Pipe.Context{halted: true} = context ->
+            nil
+            context
+          %Pipe.Context{pipe_branch: :hit} = context ->
+            context = Map.put(context, :pipe_branch, nil)
+            case(MyPipe.exec_with_hooks(context, [])) do
+              %Pipe.Context{halted: true} = context ->
+                nil
+                context
+              %Pipe.Context{} = context ->
+                case(hello(context, upper: true)) do
+                  %Pipe.Context{halted: true} = context ->
+                    nil
+                    context
+                  %Pipe.Context{} = context ->
+                    case(MyPipe.exec_with_hooks(context, key: "value")) do
+                      %Pipe.Context{halted: true} = context ->
+                        nil
+                        context
+                      %Pipe.Context{} = context ->
+                        case(inspect_opts(context, opts)) do
+                          %Pipe.Context{halted: true} = context ->
+                            nil
+                            context
+                          %Pipe.Context{} = context ->
+                          ...
+```
+
+<!-- livebook:{"break_markdown":true} -->
+
+#### run pipes at runtime
+
+<!-- livebook:{"force_markdown":true} -->
+
+```elixir
+  def run(%Pipework.Context{status: :pending} = context, pipes) do
+    run(%{context | status: :running}, pipes)
+  end
+
+  def run(%Pipework.Context{} = context, []) do
+    %{context | status: :done}
+  end
+
+  def run(%Pipework.Context{status: :halt} = context, _pipes) do
+    context
+  end
+
+  def run(%Pipework.Context{} = context, [pipe | pipes]) do
+    executable_pipe = get_executable_pipe(pipe)
+
+    case PipeExecutor.exec(executable_pipe, context) do
+      %Context{status: :halt} = context ->
+        context
+
+      %Context{} = context ->
+        run(context, pipes)
+
+      other ->
+        raise "expected #{inspect(pipe)} to return Pipework.Context, got: #{inspect(other)}"
+    end
+  end
+
+```
+
+## Demo
+
+```elixir
+Mix.install(
+  [
+    {:pipework, path: "/pipework", app: false}
+  ],
+  force: true
+)
+```
+
+## Pipe
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+defmodule AddPipe do
+  @behaviour Pipework.Pipe
+
+  def call(%{data: data} = context, opts) do
+    IO.puts("exec AddPipe")
+    addend = Keyword.get(opts, :addend, 0)
+    data = Enum.map(data, &(&1 + addend))
+    %{context | data: data}
+  end
+end
+
+defmodule MultiplierPipe do
+  @behaviour Pipework.Pipe
+
+  def call(%{data: data} = context, opts) do
+    IO.puts("exec MultiplierPipe")
+    multiplier = Keyword.get(opts, :multiplier)
+    data = Enum.map(data, &(&1 * multiplier))
+    %{context | data: data}
+  end
+end
+
+defmodule ToStringPipe do
+  @behaviour Pipework.Pipe
+
+  def call(%{data: data} = context, _opts) do
+    IO.puts("exec ToStringPipe")
+    data = Enum.map(data, &to_string/1)
+    %{context | data: data}
+  end
+end
+
+defmodule MaterializePipe do
+  @behaviour Pipework.Pipe
+
+  def call(%{data: data} = context, _opts) do
+    IO.puts("exec MaterializePipe")
+
+    data =
+      Enum.map(data, fn x ->
+        Process.sleep(1000)
+        %{"id" => x}
+      end)
+
+    %{context | data: data}
+  end
+end
+```
+
+## Pipeline
+
+```elixir
+defmodule NumericalPipeline do
+  use Pipework.Pipeline
+
+  pipe(AddPipe, addend: 10)
+  pipe(MultiplierPipe, multiplier: 10)
+end
+```
+
+## Concurrent task pipe
+
+```elixir
+defmodule ConurrentMaterializePipe do
+  @behaviour Pipework.TaskPipe
+
+  @impl true
+  def generate(%Pipework.Context{data: data}, opts) do
+    batch_size = Keyword.get(opts, :batch_size, 5)
+
+    data
+    |> Enum.chunk_every(batch_size)
+    |> Enum.map(fn chunk ->
+      {
+        %Pipework.Pipe{pipe: MaterializePipe},
+        %Pipework.Context{data: chunk}
+      }
+    end)
+  end
+
+  @impl true
+  def collect(context, contexts, _opts) do
+    data = Enum.flat_map(contexts, &Map.get(&1, :data))
+    %{context | data: data}
+  end
+end
+```
+
+## Branch pipe
+
+```elixir
+defmodule DataLengthBranchPipe do
+  @behaviour Pipework.Pipe
+
+  def call(%Pipework.Context{data: data} = context, opts) do
+    IO.puts("exec BranchPipe")
+    threadhold = Keyword.get(opts, :threadhold, 5)
+    branch = if length(data) > threadhold, do: :gt, else: :le
+
+    %{context | branch: branch}
+  end
+end
+```
+
+## Hook
+
+<!-- livebook:{"reevaluate_automatically":true} -->
+
+```elixir
+defmodule WrapperHook do
+  @behaviour Pipework.Hook
+
+  def call(context, pipe_opts, next) do
+    pipe_name = Keyword.get(pipe_opts, :pipe_name)
+    IO.puts("hook --> before execute pipe: #{pipe_name}")
+    res = next.(context)
+    IO.puts("hook --> after execute pipe: #{pipe_name}")
+    res
+  end
+end
+
+defmodule InspectContextHook do
+  @behaviour Pipework.Hook
+
+  def call(context, _pipe_opts, next) do
+    IO.puts("hook --> inspect context: #{inspect(context)}")
+    next.(context)
+  end
+end
+```
+
+## Pipework run
+
+```elixir
+pipes = [
+  {:pipeline, NumericalPipeline},
+  {ToStringPipe, hooks: [WrapperHook]},
+  {
+    :branch,
+    {DataLengthBranchPipe, threadhold: 10, hooks: [InspectContextHook]},
+    [
+      {:gt, {:task, ConurrentMaterializePipe, batch_size: 3}},
+      {:le, MaterializePipe}
+    ]
+  }
+]
+```
+
+```elixir
+context = %Pipework.Context{data: [1, 2, 3]}
+Pipework.run(context, pipes)
+```
+
+```elixir
+context = %Pipework.Context{data: [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]}
+Pipework.run(context, pipes)
+```
+
+## Next
+
+* more pipe type, such as {:async, _}
+* predefined hooks, pipes, such as ByPassHook
