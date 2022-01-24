@@ -62,7 +62,7 @@ pipes = [
   Pipe1,
   Pipe2,
   {:pipeline, Pipeline1},
-  {:branch, BrnachPipe, [{:branch1, Branch1}, {:branch2, Branch2}]},
+  {:branch, BranchPipe, [{:branch1, Branch1}, {:branch2, Branch2}]},
   {:task, TaskPipe}
 ]
 
