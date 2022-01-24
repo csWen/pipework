@@ -18,7 +18,7 @@
 
 ```elixir
 defprotocol Pipework.Executable do
-  @moduledoc false
+  @moduledoc "TODO"
 
   @spec exec(__MODULE__.t(), Pipework.Context.t()) :: Pipework.Context.t()
   def exec(executable, context)
@@ -36,9 +36,9 @@ defimpl Pipework.Executable, for: Pipework.TaskPipe ...
 
 ```elixir
 defmodule Pipework.PipeExecutor do
-  alias Pipework.{Executable, Hook}
+  alias Pipework.{Context, Executable, Hook}
 
-  def exec(executable, context) do
+  def exec(%Executable{} = executable, %Context{} = context) do
     case Executable.hooks(executable) do
       [] ->
         Executable.exec(executable, context)
@@ -75,21 +75,21 @@ Pipework.run(context, pipes)
 
 ```elixir
 defmodule Pipework.Hook do
-  @moduledoc false
+  @moduledoc "TODO"
 
-  alias Pipework.Context
+  alias Pipework.{Context, Executor}
 
   @type hook :: {atom(), Keyword.t()} | atom()
   @type next :: (Context.t() -> Context.t())
   @callback call(Context.t(), Pipework.opts(), next()) :: Context.t()
 
   @spec exec_with_hooks([hook()], Context.t(), next()) :: Context.t()
-  def exec_with_hooks(hooks, context, executor) do
+  def exec_with_hooks(hooks, %Context{} = context, %Executor{} = executor) do
     hooks = init_hooks(hooks)
 
     hooked_executor =
       Enum.reduce(hooks, executor, fn {hook, opts}, acc ->
-        fn ctx -> hook.call(ctx, opts, acc) end
+        fn context -> hook.call(context, opts, acc) end
       end)
 
     hooked_executor.(context)
@@ -109,7 +109,9 @@ end
 
 ```elixir
 defmodule Pipework.TaskPipe do
-  @moduledoc false
+  @moduledoc "TODO"
+
+  alias Pipework.{Context, Executable}
 
   @type t :: %__MODULE__{
           task_pipe: atom(),
@@ -117,11 +119,11 @@ defmodule Pipework.TaskPipe do
           opts: Pipework.opts()
         }
 
-  @callback generate(Pipework.Context.t(), Pipework.opts()) ::
-              [{Pipework.Executable.t(), Pipework.Context.t()}]
+  @callback generate(Context.t(), Pipework.opts()) ::
+              [{Executable.t(), Context.t()}]
 
-  @callback collect(Pipework.Context.t(), [Pipework.Context.t()], Pipework.opts()) ::
-              Pipework.Context.t()
+  @callback collect(Context.t(), [Context.t()], Pipework.opts()) ::
+              Context.t()
 
   @enforce_keys [:task_pipe]
   defstruct task_pipe: nil, opts: [], task_executor: nil
@@ -140,7 +142,7 @@ defimpl Pipework.Executable, for: Pipework.TaskPipe do
           task_executor: task_executor,
           opts: opts
         },
-        context
+        %Pipework.Context{} = context
       ) do
     case task_pipe.generate(context, opts) do
       tasks when is_list(tasks) ->
@@ -165,10 +167,12 @@ end
 
 ```elixir
 defmodule Pipework.TaskExecutor do
-  @moduledoc false
+  @moduledoc "TODO"
 
-  @callback exec([{Pipework.Executable.t(), Pipework.Context.t()}], Keyword.t()) :: [
-              Pipework.Context.t()
+  alias Pipework.{Context, Executable}
+
+  @callback exec([{Executable.t(), Context.t()}], Keyword.t()) :: [
+              Context.t()
             ]
 end
 
@@ -176,7 +180,7 @@ defmodule Pipework.TaskExecutor.Naive do
   use Pipework.TaskExecutor
 
   @impl true
-  def exec(pipe_and_context_pairs, opts) do
+  def exec(pipe_and_context_pairs, opts) when is_list(pipe_and_context_pairs) and is_list(opts) do
     timeout = Keyword.get(opts, :timeout, 5000)
 
     pipe_and_context_pairs
